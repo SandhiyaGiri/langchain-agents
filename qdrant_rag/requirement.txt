@@ -1,0 +1,14 @@
+langchain
+langgraph
+langchain-google-genai
+langchain-google-vertexai
+langchain-qdrant
+qdrant-client
+sentence-transformers
+beautifulsoup4
+duckduckgo-search
+requests
+python-dotenv
+langchain-community
+tiktoken
+pypdf

@@ -1,0 +1,14 @@
+/.env
+/venv/
+/__pycache__/
+/node_modules/
+/dist/
+/build/
+/dist/
+/build/
+/dist/
+/build/
+/sandy_env/
+/.vscode/
+
+*.env
