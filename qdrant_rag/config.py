@@ -1,6 +1,8 @@
 """Configuration module for the agentic RAG agent."""
 import os
 from typing import Optional
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -26,6 +28,31 @@ class Config:
             return int(max_retries_env)
         return 6 if cls.USE_VERTEX_AI else 2
     
+    @classmethod
+    def _normalize_qdrant_url(cls) -> None:
+        """Normalize and validate the configured Qdrant URL."""
+        if not cls.QDRANT_URL:
+            return
+
+        # Fix common typos such as "hhttps" at the start of the URL
+        if cls.QDRANT_URL.startswith("hhttps://"):
+            cls.QDRANT_URL = "https://" + cls.QDRANT_URL[len("hhttps://"):]
+
+        if ".qdrant.ios" in cls.QDRANT_URL:
+            cls.QDRANT_URL = cls.QDRANT_URL.replace(".qdrant.ios", ".qdrant.io")
+
+        parsed = urlparse(cls.QDRANT_URL)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                "QDRANT_URL must start with http:// or https:// (received: "
+                f"{cls.QDRANT_URL})."
+            )
+        if not parsed.netloc:
+            raise ValueError(
+                "QDRANT_URL is missing a hostname. Provide a full URL, for example "
+                "https://YOUR-CLUSTER.cloud.qdrant.io"
+            )
+
     # Qdrant Configuration
     # For Qdrant Cloud: Use your cloud cluster URL (e.g., https://xxxxx-xxxxx-xxxxx.qdrant.io)
     # For local: Use http://localhost:6333
@@ -49,6 +76,8 @@ class Config:
     @classmethod
     def validate(cls) -> bool:
         """Validate that required configuration is present."""
+        cls._normalize_qdrant_url()
+
         if not cls.USE_VERTEX_AI and not cls.GOOGLE_API_KEY:
             # For Vertex AI, credentials are handled via gcloud/auth
             raise ValueError("GOOGLE_API_KEY environment variable is required when using Gemini API (not Vertex AI)")

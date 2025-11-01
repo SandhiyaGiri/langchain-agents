@@ -6,6 +6,7 @@ from langchain.tools import tool
 from pypdf import PdfReader
 from qdrant_client.models import PointStruct
 import hashlib
+from tqdm import tqdm
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,9 +30,11 @@ def _extract_text_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
         
         reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
         pages_data = []
         
-        for page_num, page in enumerate(reader.pages, start=1):
+        # Extract text with progress bar
+        for page_num, page in enumerate(tqdm(reader.pages, desc="Extracting text from PDF", total=total_pages, unit="page"), start=1):
             text = page.extract_text()
             if text.strip():  # Only add non-empty pages
                 pages_data.append({
@@ -113,55 +116,70 @@ def ingest_pdf_tool(pdf_path: str, chunk_size: int = 500, chunk_overlap: int = 5
         if not pages_data:
             return f"No text found in PDF: {pdf_path}"
         
+        print(f"📄 Processing {len(pages_data)} page(s)...")
+        
         # Get embedding model and Qdrant client
+        print("🔧 Loading embedding model...")
         model = _get_embedding_model()
         client = _get_qdrant_client()
         
         # Ensure collection exists
         _ensure_collection_exists(client, Config.COLLECTION_NAME)
         
-        # Process each page
+        # Process each page with progress tracking
         total_chunks = 0
         points_to_insert = []
         
+        # First pass: Count total chunks for progress bar
+        total_chunks_preview = 0
         for page_data in pages_data:
-            text = page_data["text"]
-            page_num = page_data["page"]
-            pdf_path_str = page_data["pdf_path"]
-            pdf_name = page_data["pdf_name"]
-            
-            # Chunk the text
-            chunks = _chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
-            
-            for chunk_idx, chunk in enumerate(chunks):
-                # Generate embedding
-                vector = model.encode(chunk).tolist()
+            chunks = _chunk_text(page_data["text"], chunk_size=chunk_size, overlap=chunk_overlap)
+            total_chunks_preview += len(chunks)
+        
+        # Process pages and chunks with progress bar
+        print("🔄 Generating embeddings and preparing data...")
+        with tqdm(total=total_chunks_preview, desc="Processing chunks", unit="chunk") as pbar:
+            for page_data in pages_data:
+                text = page_data["text"]
+                page_num = page_data["page"]
+                pdf_path_str = page_data["pdf_path"]
+                pdf_name = page_data["pdf_name"]
                 
-                # Generate unique ID
-                point_id = _generate_chunk_id(pdf_path_str, page_num, chunk_idx)
+                # Chunk the text
+                chunks = _chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
                 
-                # Create point with metadata
-                point = PointStruct(
-                    id=point_id,
-                    vector=vector,
-                    payload={
-                        "text": chunk,
-                        "source": pdf_path_str,
-                        "pdf_name": pdf_name,
-                        "page": page_num,
-                        "chunk_index": chunk_idx,
-                        "type": "pdf"
-                    }
-                )
-                points_to_insert.append(point)
-                total_chunks += 1
+                for chunk_idx, chunk in enumerate(chunks):
+                    # Generate embedding
+                    vector = model.encode(chunk).tolist()
+                    
+                    # Generate unique ID
+                    point_id = _generate_chunk_id(pdf_path_str, page_num, chunk_idx)
+                    
+                    # Create point with metadata
+                    point = PointStruct(
+                        id=point_id,
+                        vector=vector,
+                        payload={
+                            "text": chunk,
+                            "source": pdf_path_str,
+                            "pdf_name": pdf_name,
+                            "page": page_num,
+                            "chunk_index": chunk_idx,
+                            "type": "pdf"
+                        }
+                    )
+                    points_to_insert.append(point)
+                    total_chunks += 1
+                    pbar.update(1)
         
         # Batch insert into Qdrant
         if points_to_insert:
+            print(f"💾 Storing {total_chunks} chunk(s) in Qdrant...")
             client.upsert(
                 collection_name=Config.COLLECTION_NAME,
                 points=points_to_insert
             )
+            print("✅ Ingestion complete!")
             return (
                 f"Successfully ingested PDF: {pdf_path}\n"
                 f"- Pages processed: {len(pages_data)}\n"

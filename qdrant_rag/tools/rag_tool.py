@@ -29,6 +29,7 @@ def _get_qdrant_client() -> QdrantClient:
     """Initialize and return Qdrant client (supports both local and cloud)."""
     global _qdrant_client
     if _qdrant_client is None:
+        Config._normalize_qdrant_url()
         # Qdrant Cloud requires API key, local doesn't
         if Config.QDRANT_API_KEY:
             _qdrant_client = QdrantClient(

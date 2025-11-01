@@ -12,3 +12,5 @@ python-dotenv
 langchain-community
 tiktoken
 pypdf
+tqdm
+InquirerPy

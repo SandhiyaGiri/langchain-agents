@@ -20,6 +20,7 @@ A Python-based agentic RAG (Retrieval-Augmented Generation) agent using Gemini A
 
 1. **Install dependencies**:
    ```bash
+   cd qdrant_rag
    pip install -r requirement.txt
    ```
 
@@ -68,6 +69,42 @@ A Python-based agentic RAG (Retrieval-Augmented Generation) agent using Gemini A
    docker run -p 6333:6333 qdrant/qdrant
    ```
 
+## Quick Start - Chat with the Agent
+
+### Interactive Chat (Recommended)
+
+The easiest way to use the agent is through the interactive chat interface:
+
+```bash
+cd qdrant_rag
+python chat.py
+```
+
+**See [CHAT_GUIDE.md](CHAT_GUIDE.md) for detailed instructions and examples.**
+
+This interactive session provides:
+- ✅ **Natural chat interface** - Just type and chat
+- ✅ **Agent identification** - See which agent (Vertex AI/Gemini API) and model is responding
+- ✅ **Tool call visibility** - See all tool calls with arguments in real-time
+- ✅ **Tool results** - View tool execution results
+- ✅ **Approval workflow** - Approve/reject tool usage interactively
+- ✅ **Conversation history** - View all messages with `show` command
+- ✅ **Thread management** - Start new conversations with `new` command
+
+### Simple Python Usage
+
+```python
+from agentic_arg import invoke_agent, resume_agent
+
+# Start chatting
+result = invoke_agent("Hello!", thread_id="my_chat")
+
+# Check for interrupts (tool approvals needed)
+if isinstance(result, dict) and "__interrupt__" in result:
+    # Approve the tool call
+    result = resume_agent([{"type": "approve"}], thread_id="my_chat")
+```
+
 ## Usage
 
 ### PDF Querying (Main Feature)
@@ -78,7 +115,7 @@ A Python-based agentic RAG (Retrieval-Augmented Generation) agent using Gemini A
 from agentic_arg import ingest_pdf, query_pdf
 
 # Step 1: Ingest a PDF
-pdf_path = "/path/to/your/document.pdf"
+pdf_path = "/Users/sandhiya.cv/Downloads/multi-agent-architecture/Aleena_Joseph.pdf"
 result = ingest_pdf(pdf_path)
 print(result)  # Shows ingestion status
 

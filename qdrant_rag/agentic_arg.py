@@ -2,7 +2,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, List
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from langgraph.prebuilt import create_react_agent
@@ -19,24 +19,35 @@ from tools import (
 )
 
 
-# System prompt for agentic decision-making
-SYSTEM_PROMPT = """You are an intelligent assistant with access to multiple information sources:
-1. PDF Querying: Use query_pdf_tool when the user asks about content from a specific PDF or provides a PDF path
-2. PDF Ingestion: Use ingest_pdf_tool when the user provides a PDF path that needs to be processed and added to the knowledge base
-3. Knowledge Base (RAG): Use rag_search_tool when you need domain-specific knowledge or information from the knowledge base
-4. Web Search: Use google_search_tool for current events, news, or general web information
-5. URL Fetching: Use fetch_url_tool when the user provides a specific URL or link to read
+def _extract_messages_from_chunk(chunk: Dict[str, Any]) -> Optional[List[Any]]:
+    """Extract messages list from a stream chunk."""
+    if "messages" in chunk:
+        return chunk["messages"]
+    for value in chunk.values():
+        if isinstance(value, dict) and "messages" in value:
+            return value["messages"]
+    return None
 
-Decision guidelines:
-- If user provides a PDF path and asks to ingest it: Use ingest_pdf_tool first, then use query_pdf_tool to answer questions
-- If user asks about a PDF or provides a PDF path with a query: Use query_pdf_tool (it will search ingested PDFs)
-- Use RAG (rag_search_tool) when the query requires domain knowledge, specific documentation, or internal information (excluding PDFs)
-- Use web search (google_search_tool) for current events, recent news, or information that changes frequently
-- Use URL fetching (fetch_url_tool) when the user explicitly provides a URL or asks about content from a specific link
-- Answer directly for simple questions, greetings, or when you have sufficient knowledge
-- You can use multiple tools in sequence if needed (e.g., ingest PDF, then query it)
 
-Always provide accurate, helpful, and well-structured responses. When using tools, quote relevant snippets and cite sources (including PDF names and page numbers) when possible."""
+# System prompt for simple agent behavior
+SYSTEM_PROMPT = """You are a helpful assistant. You should:
+
+1. **Greet the user** when starting a conversation
+2. **Answer questions directly** when you have sufficient knowledge - avoid unnecessary tool calls
+3. **Only use tools when absolutely necessary** and the user explicitly requests or it's clearly needed
+
+**PDF Tools** - Only use when:
+- User explicitly provides a PDF file path AND asks you to refer to it or query it
+- Example: "Look at /path/to/file.pdf and tell me..." or "Ingest this PDF: /path/to/file.pdf"
+- Do NOT use PDF tools for general queries unless explicitly requested
+
+**Other Tools** - Only use when:
+- User explicitly asks you to search the web or fetch a URL
+- You cannot answer the question from your knowledge
+
+**Important**: Before using ANY tool, you must ask for the user's permission. All tool calls require approval.
+
+Keep your responses concise, helpful, and natural. Avoid using tools unless truly necessary."""
 
 
 def create_agentic_rag_agent(
@@ -97,14 +108,8 @@ def create_agentic_rag_agent(
     # Bind tools to the model (required for tool calling)
     llm_with_tools = llm.bind_tools(tools)
     
-    # Setup interrupts for HIL if enabled
-    interrupt_before = None
-    if enable_hil:
-        # For LangGraph, we use interrupt_before to pause before tool execution
-        # We can specify which tools need approval
-        # Note: LangGraph doesn't support tool-specific interrupts directly,
-        # so we'll interrupt before all tool calls if HIL is enabled
-        interrupt_before = ["tools"]  # Interrupt before executing tools
+    # Setup interrupts for HIL - ALL tools require approval
+    interrupt_before = ["tools"]  # Always interrupt before executing ANY tool
     
     # Create agent using LangGraph's create_react_agent
     agent = create_react_agent(
@@ -130,19 +135,21 @@ def get_agent():
 
 
 def invoke_agent(
-    message: str,
+    message: Optional[str] = None,
     thread_id: str = "default",
     config: Optional[Dict[str, Any]] = None,
-    agent_instance: Optional[Any] = None
+    agent_instance: Optional[Any] = None,
+    greet: bool = True
 ) -> Any:
     """
     Invoke the agent with a message.
     
     Args:
-        message: User message
+        message: User message (optional, if None and greet=True, will just greet)
         thread_id: Thread ID for conversation persistence
         config: Optional additional configuration
         agent_instance: Optional agent instance (uses default if None)
+        greet: If True and this is a new conversation, agent will greet the user
     
     Returns:
         Agent response or interrupt state if HIL interrupt occurred
@@ -159,12 +166,40 @@ def invoke_agent(
     # LangGraph expects messages in a specific format
     from langchain_core.messages import HumanMessage
     
-    result = agent_instance.invoke(
-        {"messages": [HumanMessage(content=message)]},
-        config=config
-    )
+    # Build messages - agent will greet naturally based on system prompt
+    messages = []
     
-    return result
+    # If no message provided and greet=True, send minimal message to trigger greeting
+    if not message or (greet and not message.strip()):
+        # Send a simple message that will trigger the agent to greet
+        # The system prompt instructs the agent to greet, so it will respond with a greeting
+        messages.append(HumanMessage(content="Hi"))
+    elif message:
+        messages.append(HumanMessage(content=message))
+    
+    last_state: Dict[str, Any] | None = None
+    interrupt_payload = None
+    for chunk in agent_instance.stream(
+        {"messages": messages},
+        config=config
+    ):
+        extracted = _extract_messages_from_chunk(chunk)
+        if extracted is not None:
+            last_state = {"messages": extracted}
+        if "__interrupt__" in chunk:
+            interrupt_payload = chunk["__interrupt__"]
+    
+    if last_state is None:
+        last_state = {}
+    else:
+        last_state = dict(last_state)
+    state_snapshot = agent_instance.get_state(config)
+    if state_snapshot and state_snapshot.values:
+        last_state["messages"] = state_snapshot.values.get("messages", [])
+    if interrupt_payload is not None:
+        last_state["__interrupt__"] = interrupt_payload
+    
+    return last_state
 
 
 def resume_agent(
@@ -176,11 +211,11 @@ def resume_agent(
     """
     Resume agent after HIL interrupt.
     
-    For LangGraph, interrupting returns a state that can be resumed by calling invoke again.
-    The agent will automatically continue from where it paused.
+    When approving: Resumes execution and tools are executed.
+    When rejecting: Adds rejection ToolMessages so the LLM knows tools were rejected.
     
     Args:
-        decisions: Not used for LangGraph (agent auto-continues), kept for API compatibility
+        decisions: List with decision, e.g., [{"type": "approve"}] or [{"type": "reject"}]
         thread_id: Thread ID for conversation persistence
         config: Optional additional configuration
         agent_instance: Optional agent instance (uses default if None)
@@ -197,22 +232,133 @@ def resume_agent(
         config["configurable"] = config.get("configurable", {})
         config["configurable"]["thread_id"] = thread_id
     
-    # For LangGraph, when interrupted, invoke returns a state with '__interrupt__' key
-    # To resume, we pass Command(resume="value") where value is what to pass to the interrupt
-    # If decisions is provided, use it; otherwise default to "continue"
+    # Get current state to check for tool calls
+    state = agent_instance.get_state(config)
+    
+    # Accept common approval / rejection variants
+    approval_decisions = {
+        "approve",
+        "approved",
+        "accept",
+        "accepted",
+        "yes",
+        "y",
+        "ok",
+        "okay",
+        "sure",
+        "yep",
+        "yup",
+    }
+    rejection_decisions = {
+        "reject",
+        "rejected",
+        "no",
+        "n",
+        "deny",
+        "denied",
+        "decline",
+        "declined",
+        "cancel",
+        "cancelled",
+        "c",
+        "nope",
+    }
+
+    # Extract decision type (default to approve/continue)
+    decision_type = "approve"
     if decisions and len(decisions) > 0:
-        # Extract the decision type, defaulting to "approve" if available
-        resume_value = str(decisions[0].get("type", "approve"))
+        decision_type = str(decisions[0].get("type", "approve")).lower()
+
+    # If rejecting, we need to add ToolMessages for rejected tool calls
+    # This completes the tool call chain so the LLM can process the rejection
+    if decision_type in rejection_decisions:
+        from langchain_core.messages import ToolMessage, AIMessage
+        
+        if state and state.values:
+            messages = state.values.get("messages", [])
+            
+            # Find the last AIMessage with tool_calls
+            last_ai_msg = None
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    last_ai_msg = msg
+                    break
+            
+            if last_ai_msg and last_ai_msg.tool_calls:
+                # Create rejection ToolMessages for each tool call
+                # This tells the LLM that the tools were rejected
+                rejection_messages = []
+                for tool_call in last_ai_msg.tool_calls:
+                    tool_call_id = tool_call.get("id", "")
+                    tool_name = tool_call.get("name", "unknown")
+                    tool_msg = ToolMessage(
+                        content="This tool call was rejected by the user. Please inform the user that you cannot proceed without tool execution.",
+                        tool_call_id=tool_call_id,
+                        name=tool_name
+                    )
+                    rejection_messages.append(tool_msg)
+                
+                # Add rejection messages to continue the conversation
+                # The LLM will receive these and can respond appropriately
+                last_state = None
+                interrupt_payload = None
+                for chunk in agent_instance.stream(
+                    {"messages": rejection_messages},
+                    config=config
+                ):
+                    extracted = _extract_messages_from_chunk(chunk)
+                    if extracted is not None:
+                        last_state = {"messages": extracted}
+                    if "__interrupt__" in chunk:
+                        interrupt_payload = chunk["__interrupt__"]
+                if last_state is None:
+                    last_state = {}
+                else:
+                    last_state = dict(last_state)
+                state_snapshot = agent_instance.get_state(config)
+                if state_snapshot and state_snapshot.values:
+                    last_state["messages"] = state_snapshot.values.get("messages", [])
+                if interrupt_payload is not None:
+                    last_state["__interrupt__"] = interrupt_payload
+                return last_state
+    
+    # For approval, resume execution so the tools can run
+    resume_value = "continue"
+    if decision_type in approval_decisions:
+        resume_value = "approve"
     else:
         resume_value = "continue"
-    
-    # Use Command to resume from interrupt
-    result = agent_instance.invoke(
-        Command(resume=resume_value),
-        config=config
-    )
-    
-    return result
+    try:
+        stream_iter = agent_instance.stream(
+            Command(resume=resume_value),
+            config=config
+        )
+    except Exception:
+        stream_iter = agent_instance.stream(
+            {},
+            config=config
+        )
+
+    last_state = None
+    interrupt_payload = None
+    for chunk in stream_iter:
+        extracted = _extract_messages_from_chunk(chunk)
+        if extracted is not None:
+            last_state = {"messages": extracted}
+        if "__interrupt__" in chunk:
+            interrupt_payload = chunk["__interrupt__"]
+
+    if last_state is None:
+        last_state = {}
+    else:
+        last_state = dict(last_state)
+    state_snapshot = agent_instance.get_state(config)
+    if state_snapshot and state_snapshot.values:
+        last_state["messages"] = state_snapshot.values.get("messages", [])
+    if interrupt_payload is not None:
+        last_state["__interrupt__"] = interrupt_payload
+
+    return last_state
 
 
 def ingest_pdf(pdf_path: str, chunk_size: int = 500, chunk_overlap: int = 50) -> str:
@@ -253,48 +399,46 @@ def query_pdf(query: str, pdf_path: Optional[str] = None) -> str:
 
 # Example usage
 if __name__ == "__main__":
-    # Example 1: Ingest and query a PDF
-    print("Example 1: PDF ingestion and querying")
-    pdf_path = "/path/to/your/document.pdf"  # Replace with actual PDF path
-    
-    # First, ingest the PDF
-    print(f"Ingesting PDF: {pdf_path}")
-    result = invoke_agent(
-        f"Ingest this PDF: {pdf_path}",
-        thread_id="pdf_example"
-    )
-    print(result)
+    # Example 1: Start conversation (agent greets)
+    print("Example 1: Starting conversation (agent greets)")
+    result = invoke_agent(thread_id="example1", greet=True)
+    if isinstance(result, dict):
+        messages = result.get("messages", [])
+        if messages:
+            print("Agent:", messages[-1].content)
     print("\n" + "="*50 + "\n")
     
-    # Then query it
-    print("Querying the PDF")
-    result = invoke_agent(
-        f"What is the main topic discussed in {pdf_path}?",
-        thread_id="pdf_example"
-    )
-    print(result)
-    print("\n" + "="*50 + "\n")
-    
-    # Example 2: Simple query
-    print("Example 2: Simple query")
+    # Example 2: Simple query (no tools needed)
+    print("Example 2: Simple query (no tools)")
     result = invoke_agent("What is Python?", thread_id="example2")
-    print(result)
+    if isinstance(result, dict):
+        messages = result.get("messages", [])
+        if messages:
+            print("Agent:", messages[-1].content)
     print("\n" + "="*50 + "\n")
     
-    # Example 3: Query with URL (will trigger HIL)
-    print("Example 3: Query with URL (HIL interrupt)")
+    # Example 3: Query with PDF (will trigger HIL for tool approval)
+    print("Example 3: Query with PDF (requires approval)")
+    pdf_path = "/Users/sandhiya.cv/Downloads/multi-agent-architecture/Aleena_Joseph.pdf"
     result = invoke_agent(
-        "What is in this link: https://www.python.org/about/",
+        f"Please look at this PDF: {pdf_path} and tell me what it contains",
         thread_id="example3"
     )
     
-    # Check if HIL interrupted
-    if isinstance(result, Command):
-        print("HIL interrupt occurred. Resuming with approval...")
+    # Check if HIL interrupted (agent will pause before using tools)
+    if isinstance(result, dict) and "__interrupt__" in result:
+        print("\n[INTERRUPT] Tool approval needed before accessing PDF.")
+        print("Resuming with approval...")
         result = resume_agent(
             [{"type": "approve"}],
             thread_id="example3"
         )
-    
-    print(result)
+        if isinstance(result, dict):
+            messages = result.get("messages", [])
+            if messages:
+                print("Agent:", messages[-1].content)
+    elif isinstance(result, dict):
+        messages = result.get("messages", [])
+        if messages:
+            print("Agent:", messages[-1].content)
 
